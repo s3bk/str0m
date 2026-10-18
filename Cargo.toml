@@ -340,6 +340,12 @@ path = "tests/vla.rs"
 [dependencies.arrayvec]
 version = "0.7.6"
 
+[dependencies.bytes]
+version = "1"
+
+[dependencies.bitmule-buf]
+path = "../../crates/bitmule-buf"
+
 [dependencies.base64ct]
 version = "1"
 
