@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add zero-copy data channel writes and `Delivery` of incoming messages in the parts they arrived in
   * Write SDP that str0m can read back when it rejects every m-line #1101
   * Check every m-line for SDP consistency and accept rejected m-lines without payload types #1100
   * Expose H264 NAL unit detection for single NAL, STAP-A, and FU-A payloads #1099

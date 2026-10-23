@@ -1746,8 +1746,7 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.10.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bba218fe5119005820ab5aa74ffae0f1267763ae242541f5787ef42427cff262"
+source = "git+https://github.com/s3bk/sctp-proto?branch=data-channel-zero-copy#c29cf71af7f69fcbbe24ba46e2735fe9c80093d0"
 dependencies = [
  "bytes",
  "crc",
@@ -1938,6 +1937,7 @@ dependencies = [
  "_str0m_test",
  "arrayvec",
  "base64ct",
+ "bytes",
  "combine",
  "dimpl",
  "drv",

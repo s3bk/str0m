@@ -1,8 +1,9 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use netem::NetemConfig;
-use str0m::channel::{ChannelConfig, ChannelId};
+use str0m::channel::{ChannelConfig, ChannelId, Delivery};
 use str0m::{Event, Input, Output, Rtc, RtcConfig, RtcError};
 
 mod common;
@@ -929,6 +930,171 @@ pub fn channel_config_with_protocol() -> Result<(), RtcError> {
 
     assert_eq!(l_config.protocol, custom_protocol);
     assert_eq!(r_config.protocol, custom_protocol);
+
+    Ok(())
+}
+
+/// Writing owned `Bytes` must deliver the same messages as writing a slice.
+#[test]
+pub fn data_channel_write_bytes() -> Result<(), RtcError> {
+    init_crypto_default();
+
+    let mut l = TestRtc::new(Peer::Left);
+    let mut r = TestRtc::new(Peer::Right);
+
+    l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+    r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
+
+    let mut change = l.sdp_api();
+    let cid = change.add_channel("write-bytes".into());
+    let (offer, pending) = change.apply().unwrap();
+
+    let answer = r.rtc.sdp_api().accept_offer(offer)?;
+    l.rtc.sdp_api().accept_answer(pending, answer)?;
+
+    while l.channel(cid).is_none() || r.channel(cid).is_none() {
+        progress(&mut l, &mut r)?;
+        assert!(
+            l.duration() < Duration::from_secs(10),
+            "channel should open"
+        );
+    }
+
+    // Larger than one SCTP DATA chunk, so it is fragmented on the wire.
+    let binary: Vec<u8> = (0..4000).map(|i| (i % 251) as u8).collect();
+
+    {
+        let mut chan = l.channel(cid).expect("open channel");
+        assert!(chan.write_bytes(true, Bytes::from(binary.clone()))?);
+        assert!(chan.write_bytes(false, Bytes::from_static(b"text"))?);
+    }
+
+    let mut got_binary = false;
+    let mut got_text = false;
+
+    loop {
+        progress(&mut l, &mut r)?;
+
+        for (_, e) in &r.events {
+            let Event::ChannelData(d) = e else {
+                continue;
+            };
+            assert_eq!(d.id, cid);
+
+            if d.data == binary {
+                assert!(d.binary, "binary message reported as text");
+                got_binary = true;
+            } else if d.data.as_slice() == b"text" {
+                assert!(!d.binary, "text message reported as binary");
+                got_text = true;
+            } else {
+                panic!("unexpected message of {} bytes", d.data.len());
+            }
+        }
+
+        if got_binary && got_text {
+            break;
+        }
+
+        assert!(
+            l.duration() < Duration::from_secs(20),
+            "messages written from Bytes should arrive"
+        );
+    }
+
+    Ok(())
+}
+
+/// `Delivery::Merged` and `Delivery::Segments` report an incoming message as the
+/// memory it arrived in, instead of copying it into a `Vec`.
+#[test]
+pub fn data_channel_delivery_parts() -> Result<(), RtcError> {
+    init_crypto_default();
+
+    // Larger than one SCTP DATA chunk, so the message arrives in several parts.
+    let message: Vec<u8> = (0..4000).map(|i| (i % 251) as u8).collect();
+
+    for delivery in [Delivery::Merged, Delivery::Segments] {
+        let now = Instant::now();
+
+        let mut l = TestRtc::new(Peer::Left);
+        let mut r = TestRtc::new_with_rtc(
+            tracing::info_span!("R"),
+            Rtc::builder().set_channel_delivery(delivery).build(now),
+        );
+
+        l.add_host_candidate((Ipv4Addr::new(1, 1, 1, 1), 1000).into());
+        r.add_host_candidate((Ipv4Addr::new(2, 2, 2, 2), 2000).into());
+
+        let mut change = l.sdp_api();
+        let cid = change.add_channel("parts".into());
+        let (offer, pending) = change.apply().unwrap();
+
+        let answer = r.rtc.sdp_api().accept_offer(offer)?;
+        l.rtc.sdp_api().accept_answer(pending, answer)?;
+
+        while l.channel(cid).is_none() || r.channel(cid).is_none() {
+            progress(&mut l, &mut r)?;
+            assert!(
+                l.duration() < Duration::from_secs(10),
+                "channel should open"
+            );
+        }
+
+        {
+            let mut chan = l.channel(cid).expect("open channel");
+            assert!(chan.write_bytes(true, Bytes::from(message.clone()))?);
+        }
+
+        let mut got_message = false;
+
+        loop {
+            progress(&mut l, &mut r)?;
+
+            for (_, e) in &r.events {
+                let m = match e {
+                    Event::ChannelData(_) => {
+                        panic!("ChannelData is not used with delivery {delivery:?}")
+                    }
+                    Event::ChannelMessage(m) => m,
+                    _ => continue,
+                };
+
+                assert_eq!(m.id, cid);
+
+                let mut joined = Vec::with_capacity(m.parts.iter().map(|p| p.len()).sum());
+                for part in &m.parts {
+                    joined.extend_from_slice(part);
+                }
+
+                if joined == message {
+                    assert!(m.binary, "binary message reported as text");
+                    match delivery {
+                        Delivery::Merged => {
+                            assert_eq!(m.parts.len(), 1, "a merged message is one buffer");
+                        }
+                        Delivery::Segments => assert!(
+                            m.parts.len() > 1,
+                            "a fragmented message has one part per SCTP chunk"
+                        ),
+                        Delivery::Vec => unreachable!("not used in this test"),
+                    }
+                    got_message = true;
+                } else {
+                    panic!("unexpected message of {} bytes", joined.len());
+                }
+            }
+
+            if got_message {
+                break;
+            }
+
+            assert!(
+                l.duration() < Duration::from_secs(20),
+                "messages should arrive with delivery {delivery:?}"
+            );
+        }
+    }
 
     Ok(())
 }

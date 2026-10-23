@@ -834,7 +834,9 @@ pub mod format;
 use format::CodecConfig;
 
 pub mod channel;
+mod rxbuf;
 use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
+pub use rxbuf::{RxBuf, RxPool, set_rx_pool};
 
 pub mod media;
 use media::AppSpecificFeedback;
@@ -912,7 +914,6 @@ pub struct Rtc {
     ice: IceAgent,
     dtls: Dtls,
     dtls_connected: bool,
-    dtls_buf: Vec<u8>,
     next_dtls_timeout: Option<Instant>,
     sctp: RtcSctp,
     chan: ChannelHandler,
@@ -996,6 +997,10 @@ pub enum Event {
 
     /// Incoming data channel data from the remote peer.
     ChannelData(ChannelData),
+
+    /// Incoming data channel data as the memory it arrived in, when the
+    /// config asks for it ([`RtcConfig::set_channel_delivery`]).
+    ChannelMessage(channel::ChannelMessage),
 
     /// A data channel has been closed.
     ChannelClose(ChannelId),
@@ -1269,6 +1274,7 @@ impl Rtc {
             sctp.enable_snap();
         }
         sctp.set_max_buffered_amount(config.sctp_max_buffered_amount);
+        sctp.set_delivery(config.channel_delivery);
 
         Ok(Rtc {
             state: RtcState::Alive,
@@ -1283,7 +1289,6 @@ impl Rtc {
             )
             .expect("DTLS to init without problem"),
             dtls_connected: false,
-            dtls_buf: vec![0; 2000],
             next_dtls_timeout: None,
             session,
             sctp,
@@ -1570,6 +1575,7 @@ impl Rtc {
         match &o {
             Output::Event(e) => match e {
                 Event::ChannelData(_)
+                | Event::ChannelMessage(_)
                 | Event::MediaData(_)
                 | Event::RtpPacket(_)
                 | Event::SenderFeedback(_)
@@ -1654,7 +1660,8 @@ impl Rtc {
         // Poll DTLS output - collect packets, handle events
         let mut just_connected = false;
         loop {
-            match self.dtls.poll_output(&mut self.dtls_buf) {
+            let mut packet = rxbuf::get(rxbuf::PACKET);
+            match self.dtls.poll_output(&mut packet.spare()[..rxbuf::PACKET]) {
                 DtlsOutput::Packet(_) => {
                     unreachable!("We don't expect DTLS packets here since we use poll_packet");
                 }
@@ -1715,7 +1722,10 @@ impl Rtc {
                     }
                 }
                 DtlsOutput::ApplicationData(data) => {
-                    self.sctp.handle_input(self.last_now, data);
+                    // The decrypted packet stays where it is: SCTP keeps slices of it.
+                    let len = data.len();
+                    self.sctp
+                        .handle_input(self.last_now, packet.into_bytes(len));
                 }
                 DtlsOutput::Timeout(t) => {
                     self.next_dtls_timeout = Some(t);
@@ -1806,6 +1816,14 @@ impl Rtc {
                     };
                     let cd = ChannelData { id, binary, data };
                     return Ok(Some(Output::Event(Event::ChannelData(cd))));
+                }
+                SctpEvent::Message { id, binary, parts } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                        warn!("Drop ChannelMessage event for id: {:?}", id);
+                        continue;
+                    };
+                    let message = channel::ChannelMessage { id, binary, parts };
+                    return Ok(Some(Output::Event(Event::ChannelMessage(message))));
                 }
                 SctpEvent::BufferedAmountLow { id } => {
                     let Some(id) = self.chan.channel_id_by_stream_id(id) else {
@@ -2194,6 +2212,7 @@ impl PartialEq for Event {
             (Self::MediaData(m1), Self::MediaData(m2)) => m1 == m2,
             (Self::ChannelOpen(l0, l1), Self::ChannelOpen(r0, r1)) => l0 == r0 && l1 == r1,
             (Self::ChannelData(l0), Self::ChannelData(r0)) => l0 == r0,
+            (Self::ChannelMessage(l0), Self::ChannelMessage(r0)) => l0 == r0,
             (Self::ChannelClose(l0), Self::ChannelClose(r0)) => l0 == r0,
             _ => false,
         }

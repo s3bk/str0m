@@ -58,6 +58,7 @@ pub struct RtcConfig {
     pub(crate) dtls_version: DtlsVersion,
     pub(crate) vp9_packetizer_mode: Vp9PacketizerMode,
     pub(crate) snap_enabled: bool,
+    pub(crate) channel_delivery: crate::channel::Delivery,
     pub(crate) mtu: RangeInclusive<usize>,
 }
 
@@ -811,6 +812,17 @@ impl RtcConfig {
         self
     }
 
+    /// How incoming data channel messages are delivered.
+    ///
+    /// Default: [`Delivery::Vec`][crate::channel::Delivery::Vec], which reports each
+    /// message in an [`Event::ChannelData`][crate::Event::ChannelData] as a `Vec`.
+    /// The other variants report [`Event::ChannelMessage`][crate::Event::ChannelMessage]
+    /// with the parts the message arrived in, which can avoid copies.
+    pub fn set_channel_delivery(mut self, delivery: crate::channel::Delivery) -> Self {
+        self.channel_delivery = delivery;
+        self
+    }
+
     /// Set which DTLS version to use.
     ///
     /// Defaults to [`DtlsVersion::Dtls12`].
@@ -938,6 +950,7 @@ impl Default for RtcConfig {
             dtls_version: DtlsVersion::Dtls12,
             vp9_packetizer_mode: Vp9PacketizerMode::default(),
             snap_enabled: false,
+            channel_delivery: crate::channel::Delivery::default(),
             mtu: DATAGRAM_MTU_TARGET..=DATAGRAM_MTU_WARN,
         }
     }

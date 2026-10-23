@@ -58,6 +58,7 @@ pub(crate) struct RtcSctp {
     local_max_message_size: u32,
     remote_max_message_size: u32,
     snap_enabled: bool,
+    delivery: crate::channel::Delivery,
     snap_init: Option<SctpInitData>,
     /// Bytes that can be buffered across all streams before `available()` is 0.
     max_buffered_amount: usize,
@@ -157,6 +158,13 @@ pub(crate) enum SctpEvent {
         id: u16,
         binary: bool,
         data: Vec<u8>,
+    },
+    /// A message with the parts it arrived in, when the delivery is not
+    /// [`Delivery::Vec`][crate::channel::Delivery::Vec].
+    Message {
+        id: u16,
+        binary: bool,
+        parts: Vec<bytes::Bytes>,
     },
     BufferedAmountLow {
         id: u16,
@@ -318,6 +326,7 @@ impl RtcSctp {
             local_max_message_size,
             remote_max_message_size: DEFAULT_REMOTE_MAX_MESSAGE_SIZE,
             snap_enabled: false,
+            delivery: crate::channel::Delivery::default(),
             snap_init: None,
             max_buffered_amount: DEFAULT_MAX_BUFFERED_AMOUNT,
             #[cfg(test)]
@@ -650,6 +659,46 @@ impl RtcSctp {
         Ok(stream.write_with_ppi(buf, ppi)?)
     }
 
+    /// Like `write`, but takes the buffer over: SCTP sends slices of it, so it is
+    /// not copied and lives until the peer acknowledges the data.
+    pub fn write_bytes(
+        &mut self,
+        id: u16,
+        binary: bool,
+        buf: bytes::Bytes,
+    ) -> Result<usize, SctpError> {
+        if self.state != RtcSctpState::Established || self.is_closing() || self.is_closed() {
+            return Err(SctpError::WriteBeforeEstablished);
+        }
+
+        let assoc = self
+            .assoc
+            .as_mut()
+            .ok_or(SctpError::WriteBeforeEstablished)?;
+
+        let rec = entry_by_id(&self.entries, id).expect("stream entry for write");
+
+        if rec.state != StreamEntryState::Open {
+            return Err(SctpError::WriteBeforeEstablished);
+        }
+
+        let mut stream = assoc.stream(id)?;
+
+        let ppi = match (binary, buf.is_empty()) {
+            (true, true) => PayloadProtocolIdentifier::BinaryEmpty,
+            (true, false) => PayloadProtocolIdentifier::Binary,
+            (false, true) => PayloadProtocolIdentifier::StringEmpty,
+            (false, false) => PayloadProtocolIdentifier::String,
+        };
+
+        Ok(stream.write_owned_with_ppi(buf, ppi)?)
+    }
+
+    /// How incoming messages are delivered, see [`Delivery`][crate::channel::Delivery].
+    pub fn set_delivery(&mut self, delivery: crate::channel::Delivery) {
+        self.delivery = delivery;
+    }
+
     pub fn buffered_amount(&mut self, id: u16) -> usize {
         let Some(assoc) = self.assoc.as_mut() else {
             return 0;
@@ -670,11 +719,13 @@ impl RtcSctp {
         entry.buffered_threshold.set(threshold);
     }
 
-    pub fn handle_input(&mut self, now: Instant, data: &[u8]) {
+    /// Handle a decrypted SCTP packet.
+    ///
+    /// The packet is passed as memory SCTP may keep slices of, so the payload
+    /// of a message need not be copied on the way in.
+    pub fn handle_input(&mut self, now: Instant, data: bytes::Bytes) {
         trace!("Handle input: {}", data.len());
 
-        // TODO, remove Bytes in sctp and just use &[u8].
-        let data = data.to_vec().into();
         let r = self.endpoint.handle(now, self.fake_addr, None, None, data);
 
         let Some((handle, event)) = r else {
@@ -1021,22 +1072,36 @@ impl RtcSctp {
 
                     entry.buffered_threshold = BufferedThresholdConfig::Configured(x);
                 }
-                match stream_read_data(&mut stream) {
-                    Ok(Some((buf, ppi))) => {
+                match stream_read_data(&mut stream, self.delivery) {
+                    Ok(Some((read, ppi))) => {
                         if ppi != PayloadProtocolIdentifier::Dcep {
                             // This is the normal path for incoming data.
-                            let buf = ppi_adjust_buf(buf, ppi);
                             let binary = matches!(
                                 ppi,
                                 PayloadProtocolIdentifier::Binary
                                     | PayloadProtocolIdentifier::BinaryEmpty
                             );
-                            return Some(SctpEvent::Data {
-                                id: entry.id,
-                                binary,
-                                data: buf,
-                            });
+                            match read {
+                                Read::Vec(buf) => {
+                                    let buf = ppi_adjust_buf(buf, ppi);
+                                    return Some(SctpEvent::Data {
+                                        id: entry.id,
+                                        binary,
+                                        data: buf,
+                                    });
+                                }
+                                Read::Parts(parts) => {
+                                    return Some(SctpEvent::Message {
+                                        id: entry.id,
+                                        binary,
+                                        parts,
+                                    });
+                                }
+                            }
                         }
+                        let Read::Vec(buf) = read else {
+                            unreachable!("DCEP is always read into a Vec")
+                        };
 
                         // It's Dcep, either a DcepOpen or DcepAck.
                         match entry.state {
@@ -1263,14 +1328,50 @@ fn stream_entry<'a>(
     &mut entries[idx]
 }
 
+/// A message read from a stream.
+enum Read {
+    Vec(Vec<u8>),
+    /// The message is these concatenated.
+    Parts(Vec<bytes::Bytes>),
+}
+
 fn stream_read_data(
     stream: &mut Stream,
-) -> Result<Option<(Vec<u8>, PayloadProtocolIdentifier)>, SctpError> {
+    delivery: crate::channel::Delivery,
+) -> Result<Option<(Read, PayloadProtocolIdentifier)>, SctpError> {
+    use crate::channel::Delivery;
+
     let Some(chunks) = stream.read()? else {
         return Ok(None);
     };
 
     let n = chunks.len();
+
+    if delivery != Delivery::Vec {
+        match chunks.ppi {
+            PayloadProtocolIdentifier::String | PayloadProtocolIdentifier::Binary => {
+                let parts = if delivery == Delivery::Segments {
+                    chunks.fragments().cloned().collect()
+                } else if n <= crate::rxbuf::MESSAGE {
+                    let mut message = crate::rxbuf::get(n);
+                    let l = chunks.read(&mut message.spare()[..n])?;
+                    assert!(l == n);
+                    vec![message.into_bytes(n)]
+                } else {
+                    let mut buf = vec![0; n];
+                    let l = chunks.read(&mut buf)?;
+                    assert!(l == n);
+                    vec![bytes::Bytes::from(buf)]
+                };
+                return Ok(Some((Read::Parts(parts), chunks.ppi)));
+            }
+            PayloadProtocolIdentifier::StringEmpty | PayloadProtocolIdentifier::BinaryEmpty => {
+                return Ok(Some((Read::Parts(Vec::new()), chunks.ppi)));
+            }
+            _ => {} // DCEP and the unknown: as before
+        }
+    }
+
     let mut buf = vec![0; n];
 
     let l = chunks.read(&mut buf)?;
@@ -1287,7 +1388,7 @@ fn stream_read_data(
         }
     }
 
-    Ok(Some((buf, chunks.ppi)))
+    Ok(Some((Read::Vec(buf), chunks.ppi)))
 }
 
 fn ppi_adjust_buf(mut buf: Vec<u8>, ppi: PayloadProtocolIdentifier) -> Vec<u8> {
@@ -1326,6 +1427,12 @@ impl fmt::Debug for SctpEvent {
                 .field("id", id)
                 .field("binary", binary)
                 .field("data", &data.len())
+                .finish(),
+            Self::Message { id, binary, parts } => f
+                .debug_struct("Message")
+                .field("id", id)
+                .field("binary", binary)
+                .field("parts", &parts.len())
                 .finish(),
             Self::BufferedAmountLow { id } => {
                 f.debug_struct("BufferedAmountLow").field("id", id).finish()
@@ -1439,7 +1546,7 @@ mod tests {
             while let Some(t) = client.poll_transmit() {
                 if let Some(bufs) = transmit_to_vec(t) {
                     for buf in bufs {
-                        server.handle_input(now, &buf);
+                        server.handle_input(now, buf.into());
                     }
                 }
             }
@@ -1447,7 +1554,7 @@ mod tests {
             while let Some(e) = server.do_poll() {
                 if let SctpEvent::Transmit { packets } = e {
                     for buf in packets {
-                        client.handle_input(now, &buf);
+                        client.handle_input(now, buf.into());
                     }
                 }
             }
@@ -1456,7 +1563,7 @@ mod tests {
             while let Some(t) = server.poll_transmit() {
                 if let Some(bufs) = transmit_to_vec(t) {
                     for buf in bufs {
-                        client.handle_input(now, &buf);
+                        client.handle_input(now, buf.into());
                     }
                 }
             }
@@ -1464,7 +1571,7 @@ mod tests {
             while let Some(e) = client.do_poll() {
                 if let SctpEvent::Transmit { packets } = e {
                     for buf in packets {
-                        server.handle_input(now, &buf);
+                        server.handle_input(now, buf.into());
                     }
                 }
             }
@@ -1672,12 +1779,12 @@ mod tests {
         for _ in 0..4 {
             while let Some(transmit) = client.poll_transmit() {
                 for packet in transmit_to_vec(transmit).unwrap() {
-                    server.handle_input(now, &packet);
+                    server.handle_input(now, packet.into());
                 }
             }
             while let Some(transmit) = server.poll_transmit() {
                 for packet in transmit_to_vec(transmit).unwrap() {
-                    client.handle_input(now, &packet);
+                    client.handle_input(now, packet.into());
                 }
             }
         }
@@ -1710,8 +1817,8 @@ mod tests {
             while let Some(e) = from.do_poll() {
                 if let SctpEvent::Transmit { packets } = e {
                     for p in packets {
-                        to.handle_input(now, &p);
-                        wire.extend(p);
+                        wire.extend_from_slice(&p);
+                        to.handle_input(now, p.into());
                     }
                 }
             }
