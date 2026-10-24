@@ -62,6 +62,7 @@ dimpl = { version = "0.7.1", default-features = false }
 drv = { version = "0.4.3" }
 time = "0.3"
 base64ct = "1"
+bytes = "1"
 
 # Proto dependencies
 openssl = "0.10.78"
@@ -136,6 +137,7 @@ arrayvec.workspace = true
 serde.workspace = true
 time.workspace = true
 base64ct.workspace = true
+bytes.workspace = true
 
 # DTLS made for str0m (required dependency)
 dimpl.workspace = true

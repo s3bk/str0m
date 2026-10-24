@@ -827,6 +827,8 @@ pub mod format;
 use format::CodecConfig;
 
 pub mod channel;
+mod rxbuf;
+pub use rxbuf::{RxBuf, RxPool, set_rx_pool};
 use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
 
 pub mod media;
@@ -905,7 +907,6 @@ pub struct Rtc {
     ice: IceAgent,
     dtls: Dtls,
     dtls_connected: bool,
-    dtls_buf: Vec<u8>,
     next_dtls_timeout: Option<Instant>,
     sctp: RtcSctp,
     chan: ChannelHandler,
@@ -920,6 +921,11 @@ pub struct Rtc {
     peer_bytes_tx: u64,
     change_counter: usize,
     last_timeout_reason: Reason,
+
+    /// Set by `do_poll_output_once` to ask `do_poll_output` to run it again.
+    /// Looping instead of recursing keeps the stack flat however many SCTP
+    /// packets are queued.
+    repoll: bool,
     crypto_provider: Arc<crate::crypto::CryptoProvider>,
     fingerprint_verification: bool,
     close_dtls_started: bool,
@@ -989,6 +995,10 @@ pub enum Event {
 
     /// Incoming data channel data from the remote peer.
     ChannelData(ChannelData),
+
+    /// Incoming data channel data as the memory it arrived in, when the
+    /// config asks for it ([`RtcConfig::set_channel_delivery`]).
+    ChannelMessage(channel::ChannelMessage),
 
     /// A data channel has been closed.
     ChannelClose(ChannelId),
@@ -1256,6 +1266,7 @@ impl Rtc {
         if config.snap_enabled {
             sctp.enable_snap();
         }
+        sctp.set_delivery(config.channel_delivery);
 
         Ok(Rtc {
             state: RtcState::Alive,
@@ -1270,7 +1281,6 @@ impl Rtc {
             )
             .expect("DTLS to init without problem"),
             dtls_connected: false,
-            dtls_buf: vec![0; 2000],
             next_dtls_timeout: None,
             session,
             sctp,
@@ -1285,6 +1295,7 @@ impl Rtc {
             peer_bytes_tx: 0,
             change_counter: 0,
             last_timeout_reason: Reason::NotHappening,
+            repoll: false,
             crypto_provider,
             fingerprint_verification: config.fingerprint_verification,
             close_dtls_started: false,
@@ -1551,6 +1562,7 @@ impl Rtc {
         match &o {
             Output::Event(e) => match e {
                 Event::ChannelData(_)
+                | Event::ChannelMessage(_)
                 | Event::MediaData(_)
                 | Event::RtpPacket(_)
                 | Event::SenderFeedback(_)
@@ -1575,6 +1587,16 @@ impl Rtc {
     }
 
     fn do_poll_output(&mut self) -> Result<Output, RtcError> {
+        loop {
+            self.repoll = false;
+            let output = self.do_poll_output_once();
+            if !self.repoll {
+                return output;
+            }
+        }
+    }
+
+    fn do_poll_output_once(&mut self) -> Result<Output, RtcError> {
         if self.state == RtcState::Closed {
             self.last_timeout_reason = Reason::NotHappening;
             return Ok(Output::Timeout(not_happening()));
@@ -1634,7 +1656,8 @@ impl Rtc {
         // Poll DTLS output - collect packets, handle events
         let mut just_connected = false;
         loop {
-            match self.dtls.poll_output(&mut self.dtls_buf) {
+            let mut packet = rxbuf::get(rxbuf::PACKET);
+            match self.dtls.poll_output(&mut packet.spare()[..rxbuf::PACKET]) {
                 DtlsOutput::Packet(_) => {
                     unreachable!("We don't expect DTLS packets here since we use poll_packet");
                 }
@@ -1678,7 +1701,9 @@ impl Rtc {
                     }
                 }
                 DtlsOutput::ApplicationData(data) => {
-                    self.sctp.handle_input(self.last_now, data);
+                    // the decrypted packet stays where it is; SCTP keeps slices of it
+                    let len = data.len();
+                    self.sctp.handle_input_bytes(self.last_now, packet.into_bytes(len));
                 }
                 DtlsOutput::Timeout(t) => {
                     self.next_dtls_timeout = Some(t);
@@ -1716,7 +1741,8 @@ impl Rtc {
                                 if !packets.is_empty() {
                                     self.sctp.push_back_transmit(packets);
                                 }
-                                return self.do_poll_output();
+                                self.repoll = true;
+                                return Ok(Output::Timeout(not_happening()));
                             } else {
                                 return Err(e.into());
                             }
@@ -1731,7 +1757,8 @@ impl Rtc {
 
                         // Run again since this would feed the DTLS subsystem
                         // to produce a packet now.
-                        return self.do_poll_output();
+                        self.repoll = true;
+                                return Ok(Output::Timeout(not_happening()));
                     }
                 }
                 SctpEvent::Open { id, label } => {
@@ -1769,6 +1796,14 @@ impl Rtc {
                     };
                     let cd = ChannelData { id, binary, data };
                     return Ok(Output::Event(Event::ChannelData(cd)));
+                }
+                SctpEvent::Message { id, binary, parts } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                        warn!("Drop ChannelMessage event for id: {:?}", id);
+                        continue;
+                    };
+                    let message = channel::ChannelMessage { id, binary, parts };
+                    return Ok(Output::Event(Event::ChannelMessage(message)));
                 }
                 SctpEvent::BufferedAmountLow { id } => {
                     let Some(id) = self.chan.channel_id_by_stream_id(id) else {
